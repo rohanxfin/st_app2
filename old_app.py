@@ -264,14 +264,20 @@ def get_age_bracket(age):
     """
     Returns a label based on the age bucket.
     """
-    if age < 3:
-        return '0-3'
-    elif age < 5:
-        return '3-5'
+    if age < 2:
+        return '0-2'
+    elif age < 4:
+        return '2-4'
+    elif age < 6:
+        return '4-6'
+    elif age < 8:
+        return '6-8'
     elif age < 10:
-        return '5-10'
+        return '8-10'
+    elif age < 12:
+        return '10-12'
     elif age < 15:
-        return '10-15'
+        return '12-15'
     else:
         return '15+'
 
@@ -333,113 +339,291 @@ def get_nearest_age_subset(df, make, model, variant, age, min_samples=5, max_del
     ]
 
 
-def apply_guardrails(age, distance, fuel_type, city, avg_prediction, df_subset, depreciation_rate=0.02, min_floor=50000, appreciation_rate=0.05):
+# # guardrails.py
+
+import numpy as np
+
+import numpy as np
+import pandas as pd
+
+# def get_age_bracket(age):
+#     """
+#     Example bracket function – adjust to suit your logic.
+#     E.g., every 5 years is a bracket: 0-5, 6-10, 11-15, ...
+#     """
+#     return int(age // 5) * 5
+
+def get_neighbor_brackets(df, current_bracket, num_buckets=2):
     """
-    Enhanced guardrails with:
-    - Handling for single data point cases
-    - Price appreciation for cars newer than dataset
-    - Depreciation based on bottom 25th percentile for cars older than dataset
-    - Dynamic age-based pricing
+    Given the DataFrame `df` that has a column 'Age_Bracket',
+    and a 'current_bracket', find the next `num_buckets` brackets
+    above and below in sorted order.
+    Returns a list of bracket values, including the current one.
     """
-    # Enhanced regulatory constraints for Delhi NCR
-    if (fuel_type.lower() == 'diesel' and age > 10 and 
-        city.lower() in ['delhi', 'gurgaon', 'noida']):
-        return None
+    all_brackets = sorted(df['Age_Bracket'].unique())
+    if current_bracket not in all_brackets:
+        # If your bracket isn't in the data at all, just return empty
+        return []
     
-    if (fuel_type.lower() == 'petrol' and age > 15 and 
-        city.lower() in ['delhi', 'gurgaon', 'noida']):
+    idx = all_brackets.index(current_bracket)
+    
+    # Grab up to `num_buckets` previous, the current bracket, and up to `num_buckets` next
+    lower_idx = max(0, idx - num_buckets)
+    upper_idx = min(len(all_brackets), idx + num_buckets + 1)
+    
+    neighbor_brackets = all_brackets[lower_idx:upper_idx]
+    return neighbor_brackets
+
+def get_top_n_and_bottom_n(df, brackets, top_n=2, bottom_n=2):
+    """
+    From the rows whose Age_Bracket is in `brackets`,
+    gather the top_n highest prices and bottom_n lowest prices.
+    Return (list_of_bottom_values, list_of_top_values).
+    """
+    subset = df[df['Age_Bracket'].isin(brackets)]
+    if subset.empty:
+        return [], []
+    
+    sorted_prices = sorted(subset['Price_numeric'])
+    
+    # Bottom N
+    bottom_vals = sorted_prices[:bottom_n]
+    # Top N
+    top_vals = sorted_prices[-top_n:] if len(sorted_prices) >= top_n else sorted_prices
+    
+    return bottom_vals, top_vals
+
+def apply_guardrails(age, distance, fuel_type, city, avg_prediction, df_subset,
+                     depreciation_rate=0.05,   # Default 5% annual depreciation
+                     min_floor=50000,
+                     appreciation_rate=0.05):  # 5% annual appreciation
+    """
+    Applies guardrails on the average prediction and returns a final price,
+    with added bucket-based outlier handling.
+    """
+    # 1) Regulatory constraints for certain regions and fuel types
+    if (fuel_type.lower() == 'diesel' and age > 10 and city.lower() in ['delhi', 'gurgaon', 'noida']):
+        return None
+    if (fuel_type.lower() == 'petrol' and age > 15 and city.lower() in ['delhi', 'gurgaon', 'noida']):
         return None
 
-    # Add age brackets to subset
+    # Work on a copy of the subset
     df_subset = df_subset.copy()
     df_subset['Age_Bracket'] = df_subset['Age'].apply(get_age_bracket)
     
     min_age_subset = df_subset['Age'].min()
     max_age_subset = df_subset['Age'].max()
 
-    # Initialize clamped_price with a default value
+    # -----------------------------------------------------------------
+    # Start with the raw average model prediction
+    # -----------------------------------------------------------------
     clamped_price = avg_prediction
 
-    # Handle cars newer than dataset
-    if age < min_age_subset:
-        input_bracket = get_age_bracket(age)
-        bracket_order = ['0-3', '3-5', '5-10', '10-15', '15+']
-        
-        # Find the next available age bracket in the dataset
-        next_bracket = None
-        for bracket in bracket_order[bracket_order.index(input_bracket)+1:]:
-            if bracket in df_subset['Age_Bracket'].unique():
-                next_bracket = bracket
-                break
-        
-        if next_bracket:
-            next_subset = df_subset[df_subset['Age_Bracket'] == next_bracket]
-            if not next_subset.empty:
-                # Use 75th percentile of next bracket as base price
-                if len(next_subset) >= 5:
-                    base_price = next_subset['Price_numeric'].quantile(0.75)
+    # -----------------------------------------------------------------
+    # EXACT age data
+    # -----------------------------------------------------------------
+    same_age_data = df_subset[df_subset['Age'] == age]
+    if not same_age_data.empty:
+        if len(same_age_data) >= 5:
+            # (Unchanged logic) clamp between 5th and 95th percentile
+            p_low, p_high = np.percentile(same_age_data['Price_numeric'], [5, 95])
+            clamped_price = np.clip(avg_prediction, p_low*0.98, p_high*1.02)
+        else:
+            # use the mean if <5 data points
+            clamped_price = same_age_data['Price_numeric'].mean()
+
+    else:
+        # -----------------------------------------------------------------
+        # Car is NEWER (younger) than the dataset's minimum age
+        # -----------------------------------------------------------------
+        if age < min_age_subset:
+            younger_data = df_subset[df_subset['Age'] == min_age_subset]
+            if not younger_data.empty:
+                if len(younger_data) >= 5:
+                    base_price = younger_data['Price_numeric'].quantile(0.75)
                 else:
-                    # If fewer than 5 samples, use the mean or single available price
-                    base_price = next_subset['Price_numeric'].mean()
-                
-                # Calculate the number of years below the minimum age
-                years_below = min_age_subset - age
-                
-                # Apply appreciation for each year below the minimum age
+                    base_price = younger_data['Price_numeric'].mean()
+                # Appreciate for years below the min known age
+                years_below = int(min_age_subset - age)
                 clamped_price = base_price * ((1 + appreciation_rate) ** years_below)
-        else:
-            # If no next bracket is found, use the average prediction
-            clamped_price = avg_prediction
-
-    # Adaptive percentile clamping for cars within dataset age range
-    elif age <= max_age_subset and len(df_subset) >= 1:  # Handle single data point
-        if len(df_subset) >= 5:
-            # Dynamic percentile selection based on sample size
-            lower_p = 25 if len(df_subset) < 20 else 5
-            upper_p = 75 if len(df_subset) < 20 else 95
-            
-            p_low, p_high = np.percentile(df_subset['Price_numeric'], [lower_p, upper_p])
-            clamped_price = np.clip(avg_prediction, p_low*0.95, p_high*1.05)
-        else:
-            # If fewer than 5 samples, use the mean or single available price
-            clamped_price = df_subset['Price_numeric'].mean()
-
-    # Smart depreciation for older cars
-    if age > max_age_subset and len(df_subset) > 0:
-        # Use bottom 25th percentile of the last age bracket as base price
-        last_bracket_subset = df_subset[df_subset['Age'] == max_age_subset]
-        if not last_bracket_subset.empty:
-            if len(last_bracket_subset) >= 5:
-                base_price = last_bracket_subset['Price_numeric'].quantile(0.25)  # Bottom 25th percentile
             else:
-                # If fewer than 5 samples, use the mean or single available price
-                base_price = last_bracket_subset['Price_numeric'].mean()
-            
-            # Dynamic depreciation rates
-            if fuel_type.lower() == 'diesel' and city.lower() in ['delhi', 'gurgaon', 'noida']:
-                depreciation_rate = 0.07  # Higher depreciation for diesel in NCR
-            elif fuel_type.lower() == 'petrol' and age > 15:
-                depreciation_rate = 0.05
-            
-            # Calculate years beyond the maximum age
-            years_beyond = age - max_age_subset
-            
-            # Apply depreciation
-            clamped_price = base_price * ((1 - depreciation_rate) ** years_beyond)
-        else:
-            # Fallback to average prediction if no data in the last bracket
-            clamped_price = avg_prediction
+                clamped_price = avg_prediction
 
-    # Final price adjustments
+        # -----------------------------------------------------------------
+        # Car's age is within [min_age_subset, max_age_subset] range
+        # -----------------------------------------------------------------
+        elif age <= max_age_subset and len(df_subset) >= 1:
+            if len(df_subset) >= 5:
+                # Basic percentile clamp (unchanged)
+                lower_p = 25 if len(df_subset) < 20 else 5
+                upper_p = 75 if len(df_subset) < 20 else 95
+                p_low, p_high = np.percentile(df_subset['Price_numeric'], [lower_p, upper_p])
+                clamped_price = np.clip(avg_prediction, p_low*0.97, p_high*1.03)
+            else:
+                clamped_price = df_subset['Price_numeric'].mean()
+
+        # -----------------------------------------------------------------
+        # Car is OLDER than the dataset's maximum age
+        # -----------------------------------------------------------------
+        if age > max_age_subset and len(df_subset) > 0:
+            older_data = df_subset[df_subset['Age'] == max_age_subset]
+            if not older_data.empty:
+                if len(older_data) >= 5:
+                    base_price = older_data['Price_numeric'].quantile(0.25)
+                else:
+                    base_price = older_data['Price_numeric'].mean()
+
+                # Possibly adjust depreciation
+                if fuel_type.lower() == 'diesel' and city.lower() in ['delhi', 'gurgaon', 'noida']:
+                    depreciation_rate = 0.07
+                elif fuel_type.lower() == 'petrol' and age > 15:
+                    depreciation_rate = 0.05
+
+                years_beyond = int(age - max_age_subset)
+                clamped_price = base_price * ((1 - depreciation_rate) ** years_beyond)
+            else:
+                clamped_price = avg_prediction
+
+    # -----------------------------------------------------------------
+    # ADDITIONAL STEP: Use bucket-based top/bottom logic to further
+    # clamp outliers in the final price estimate
+    # -----------------------------------------------------------------
+    this_bracket = get_age_bracket(age)
+    
+    # Find neighbor brackets (e.g., ±2 from current bracket)
+    neighbor_brackets = get_neighbor_brackets(df_subset, this_bracket, num_buckets=2)
+    
+    if neighbor_brackets:
+        bottom_vals, top_vals = get_top_n_and_bottom_n(df_subset, neighbor_brackets, top_n=2, bottom_n=2)
+        if bottom_vals and top_vals:
+            # For a simple approach, average the bottom and top sets to define robust bounds
+            robust_low_bound = np.mean(bottom_vals)
+            robust_high_bound = np.mean(top_vals)
+
+            # Add a little margin if needed:
+            robust_low_bound *= 0.95
+            robust_high_bound *= 1.05
+            
+            # Re-clamp
+            clamped_price = np.clip(clamped_price, robust_low_bound, robust_high_bound)
+
+    # -----------------------------------------------------------------
+    # Final floor: ensure we never go below a minimum floor
+    # -----------------------------------------------------------------
     final_price = max(clamped_price, min_floor)
-    
-    # # Market consistency check
-    # if len(df_subset) > 0:
-    #     market_avg = df_subset['Price_numeric'].mean()
-    #     if abs(final_price - market_avg) > (market_avg * 0.5):  # More than 50% deviation
-    #         final_price = market_avg  # Fallback to market average
-    
     return final_price
+
+
+# def apply_guardrails(age, distance, fuel_type, city, avg_prediction, df_subset,
+#                      depreciation_rate=0.05,   # Default 5% annual depreciation
+#                      min_floor=50000,
+#                      appreciation_rate=0.05):  # 5% annual appreciation
+#     """
+#     Applies guardrails on the average prediction and returns a final price.
+#     Prioritizes exact age data if it exists.
+#     """
+#     # 1) Regulatory constraints for certain regions and fuel types
+#     if (fuel_type.lower() == 'diesel' and age > 10 and city.lower() in ['delhi', 'gurgaon', 'noida']):
+#         return None
+#     if (fuel_type.lower() == 'petrol' and age > 15 and city.lower() in ['delhi', 'gurgaon', 'noida']):
+#         return None
+
+#     # Work on a copy of the subset
+#     df_subset = df_subset.copy()
+#     df_subset['Age_Bracket'] = df_subset['Age'].apply(get_age_bracket)
+#     min_age_subset = df_subset['Age'].min()
+#     max_age_subset = df_subset['Age'].max()
+
+#     # Final clamped price starts from the raw average model prediction
+#     clamped_price = avg_prediction
+
+#     # -----------------------------------------------
+#     # 0) Check if data for the EXACT same age exists
+#     # -----------------------------------------------
+#     same_age_data = df_subset[df_subset['Age'] == age]
+#     if not same_age_data.empty:
+#         # If we have at least 5 data points for this exact age,
+#         # clamp between a chosen percentile range:
+#         if len(same_age_data) >= 5:
+#             # Example: between the 5th and 95th percentile
+#             p_low, p_high = np.percentile(same_age_data['Price_numeric'], [5, 95])
+#             clamped_price = np.clip(avg_prediction,
+#                                     p_low * 0.95,
+#                                     p_high * 1.05)
+#         else:
+#             # Otherwise, use the mean if fewer than 5 data points
+#             clamped_price = same_age_data['Price_numeric'].mean()
+
+#     else:
+#         # -----------------------------------------------------------------
+#         # 1) Cars NEWER (younger) than the dataset's minimum age
+#         # -----------------------------------------------------------------
+#         if age < min_age_subset:
+#             # Subset for the minimum age in the dataset
+#             younger_data = df_subset[df_subset['Age'] == min_age_subset]
+#             if not younger_data.empty:
+#                 # Use 75th percentile or mean
+#                 if len(younger_data) >= 5:
+#                     base_price = younger_data['Price_numeric'].quantile(0.75)
+#                 else:
+#                     base_price = younger_data['Price_numeric'].mean()
+
+#                 # Years below the min age => appreciate 5% per year
+#                 years_below = int(min_age_subset - age)
+#                 clamped_price = base_price * ((1 + appreciation_rate) ** years_below)
+#             else:
+#                 # If no rows even at the min age, fallback to raw avg_prediction
+#                 clamped_price = avg_prediction
+
+#         # -----------------------------------------------------------------
+#         # 2) Cars within the dataset age range (but no exact match above)
+#         # -----------------------------------------------------------------
+#         elif age <= max_age_subset and len(df_subset) >= 1:
+#             # If we have enough data overall, clamp between some percentile
+#             if len(df_subset) >= 5:
+#                 # You can pick which percentile range you want
+#                 lower_p = 25 if len(df_subset) < 20 else 5
+#                 upper_p = 75 if len(df_subset) < 20 else 95
+#                 p_low, p_high = np.percentile(df_subset['Price_numeric'], [lower_p, upper_p])
+
+#                 clamped_price = np.clip(
+#                     avg_prediction,
+#                     p_low  * 0.97,
+#                     p_high * 1.03
+#                 )
+#             else:
+#                 # If only a few data points total, use the mean
+#                 clamped_price = df_subset['Price_numeric'].mean()
+
+#         # -----------------------------------------------------------------
+#         # 3) Cars OLDER than the dataset maximum age
+#         # -----------------------------------------------------------------
+#         if age > max_age_subset and len(df_subset) > 0:
+#             # Subset for the maximum age in the dataset
+#             older_data = df_subset[df_subset['Age'] == max_age_subset]
+#             if not older_data.empty:
+#                 # Use 25th percentile or mean
+#                 if len(older_data) >= 5:
+#                     base_price = older_data['Price_numeric'].quantile(0.25)
+#                 else:
+#                     base_price = older_data['Price_numeric'].mean()
+
+#                 # Potentially adjust depreciation for special cases
+#                 if fuel_type.lower() == 'diesel' and city.lower() in ['delhi', 'gurgaon', 'noida']:
+#                     depreciation_rate = 0.07  # Overwrite default 5%
+#                 elif fuel_type.lower() == 'petrol' and age > 15:
+#                     depreciation_rate = 0.05
+
+#                 years_beyond = int(age - max_age_subset)
+#                 clamped_price = base_price * ((1 - depreciation_rate) ** years_beyond)
+#             else:
+#                 clamped_price = avg_prediction
+
+#     # -----------------------------------------------------------
+#     # Ensure we never go below the minimum floor
+#     # -----------------------------------------------------------
+#     final_price = max(clamped_price, min_floor)
+#     return final_price
 
 def find_closest_cars(make, model, variant, age, distance, df):
     """
@@ -509,8 +693,6 @@ selected_transmission = st.sidebar.selectbox("Transmission", ['Manual', 'Automat
 # Select Fuel Type
 selected_fuel_type = st.sidebar.selectbox("Fuel Type", ['Petrol', 'Diesel', 'CNG'])
 
-selected_category = st.sidebar.selectbox("Category", ['Luxury', 'Mid-Range', 'Budget'])
-
 
 # Numeric Inputs
 age = st.sidebar.number_input("Age (years)", min_value=0, max_value=50, value=5, step=1)
@@ -522,12 +704,11 @@ range_percentage = st.sidebar.slider("Confidence Range (%)", 1, 20, 5)
 # -----------------------------------------------------------------------------
 # 5) Prediction Function
 # -----------------------------------------------------------------------------
-def predict_price_from_multiple_models(age, distance, make, car_model, variant, city, transmission, fuel_type , category):
+def predict_price_from_multiple_models(age, distance, make, car_model, variant, city, transmission, fuel_type ):
     """
     Get raw model predictions from multiple models.
     """
     # Avoid division by zero
-    distance_per_year = (distance / (age + 1)) if (age + 1) else distance
 
     input_data = pd.DataFrame([{
         'Make': make,
@@ -537,9 +718,7 @@ def predict_price_from_multiple_models(age, distance, make, car_model, variant, 
         'City': city,
         'Distance_numeric': distance,
         'Age': age,
-        'Distance_per_year': np.round(distance_per_year, 2),
-        'Variant': variant,
-        'Category': category
+        'Variant': variant
     }])
 
     predictions = {}
@@ -562,7 +741,7 @@ def predict_price_from_multiple_models(age, distance, make, car_model, variant, 
 # 6) Main Button: Generate Prediction & Apply Guardrails
 # -----------------------------------------------------------------------------
 if st.button("Predict Price"):
-    if not all([selected_make, selected_model, selected_variant, selected_city, selected_transmission, selected_fuel_type, selected_category]):
+    if not all([selected_make, selected_model, selected_variant, selected_city, selected_transmission, selected_fuel_type]):
         st.error("Please fill in all the car details.")
     else:
         # Get predictions from different models
@@ -575,7 +754,6 @@ if st.button("Predict Price"):
             city=selected_city,
             transmission=selected_transmission,
             fuel_type=selected_fuel_type,
-            category=selected_category
 
         )
 
